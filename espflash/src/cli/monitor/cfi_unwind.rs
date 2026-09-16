@@ -30,7 +30,7 @@ use gimli::{
     UnwindContext,
     UnwindSection,
 };
-use object::{Object, ObjectSection};
+use object::{Object, ObjectSection, SectionKind};
 
 use crate::cli::monitor::UnwindTables;
 
@@ -127,6 +127,10 @@ pub(crate) struct Frame {
     /// Whether `pc` is a return address rather than the address of the
     /// executing instruction.
     pub is_return_address: bool,
+    /// Whether the frame was reconstructed by scanning the stack, because its
+    /// callee didn't save the return address into it (see
+    /// [`Stop::ReturnAddressLost`]).
+    pub recovered: bool,
 }
 
 impl Frame {
@@ -151,6 +155,10 @@ pub(crate) enum Stop {
     /// The outermost frame was reached: the return address is zero or the
     /// unwind rules mark it as undefined.
     EndOfStack,
+    /// The function at the given address didn't save the return address of
+    /// its caller (functions which never return may skip that), and the
+    /// caller couldn't be reconstructed from the stack.
+    ReturnAddressLost(u32),
     /// No unwind information covers the given address.
     NoUnwindInfo(u32),
     /// A value needed for unwinding lives at the given address, which isn't
@@ -170,6 +178,11 @@ pub(crate) enum Stop {
 
 /// The unwind rules in effect at some address.
 struct Row {
+    /// The address range of the function the rules belong to.
+    function: std::ops::Range<u32>,
+    /// Whether the function saves `ra` anywhere. Functions which never
+    /// return may skip that altogether.
+    function_saves_ra: bool,
     cfa: CfaRule<usize>,
     registers: Vec<(Register, RegisterRule<usize>)>,
     /// The offset of the last stack pointer based CFA rule of the function
@@ -248,8 +261,18 @@ impl<'a, S: UnwindSection<Reader<'a>>> CfiTable for Table<'a, S> {
         let mut ctx = UnwindContext::new();
         let mut table = fde.rows(&self.section, &self.bases, &mut ctx).ok()?;
         let mut sp_cfa_offset = None;
+        let mut found = None;
+        let mut function_saves_ra = false;
 
         while let Ok(Some(row)) = table.next_row() {
+            if row.registers().any(|(register, _)| register.0 == REG_RA) {
+                function_saves_ra = true;
+            }
+
+            if found.is_some() {
+                continue;
+            }
+
             if let CfaRule::RegisterAndOffset { register, offset } = row.cfa()
                 && register.0 == REG_SP
             {
@@ -257,24 +280,49 @@ impl<'a, S: UnwindSection<Reader<'a>>> CfiTable for Table<'a, S> {
             }
 
             if row.contains(pc) {
-                return Some(Row {
-                    cfa: row.cfa().clone(),
-                    registers: row
-                        .registers()
+                found = Some((
+                    row.cfa().clone(),
+                    row.registers()
                         .map(|(register, rule)| (*register, rule.clone()))
-                        .collect(),
-                    sp_cfa_offset,
-                });
+                        .collect::<Vec<_>>(),
+                ));
             }
         }
 
-        None
+        let (cfa, registers) = found?;
+
+        Some(Row {
+            function: fde.initial_address() as u32..fde.end_address() as u32,
+            function_saves_ra,
+            cfa,
+            registers,
+            sp_cfa_offset,
+        })
     }
 }
 
 /// A stack unwinder using the CFI of one or more ELF files.
 pub(crate) struct Unwinder<'a> {
     tables: Vec<Box<dyn CfiTable + 'a>>,
+    /// The executable sections, as (address, contents).
+    code: Vec<(u64, &'a [u8])>,
+}
+
+/// What [`Unwinder::step`] can fail with.
+enum Failure {
+    Stop(Stop),
+    /// The frame's function didn't save the return address of its caller.
+    /// Carries the frame's CFA and function start.
+    ReturnAddressLost {
+        cfa: u32,
+        function_start: u32,
+    },
+}
+
+impl From<Stop> for Failure {
+    fn from(stop: Stop) -> Self {
+        Self::Stop(stop)
+    }
 }
 
 impl<'a> Unwinder<'a> {
@@ -288,11 +336,21 @@ impl<'a> Unwinder<'a> {
         let use_eh_frame = matches!(tables, UnwindTables::Auto | UnwindTables::EhFrame);
 
         let mut tables: Vec<Box<dyn CfiTable + 'a>> = Vec::new();
+        let mut code = Vec::new();
 
         for elf in elfs {
             let Ok(file) = object::File::parse(*elf) else {
                 continue;
             };
+
+            for section in file.sections() {
+                if section.kind() == SectionKind::Text
+                    && let Ok(data) = section.data()
+                    && !data.is_empty()
+                {
+                    code.push((section.address(), data));
+                }
+            }
 
             let endian = if file.is_little_endian() {
                 RunTimeEndian::Little
@@ -337,11 +395,268 @@ impl<'a> Unwinder<'a> {
             }
         }
 
-        Self { tables }
+        Self { tables, code }
     }
 
     fn row(&self, pc: u64) -> Option<Row> {
         self.tables.iter().find_map(|table| table.row(pc))
+    }
+
+    /// Reads `N` bytes of code at `addr`.
+    fn code<const N: usize>(&self, addr: u32) -> Option<[u8; N]> {
+        let addr = addr as u64;
+
+        self.code.iter().find_map(|(start, data)| {
+            let offset = addr.checked_sub(*start)? as usize;
+
+            data.get(offset..offset + N)?.try_into().ok()
+        })
+    }
+
+    /// Returns the call instruction ending right before `return_address`, if
+    /// there is one.
+    fn call_before(&self, return_address: u32) -> Option<Call> {
+        // A 32-bit `jal ra` or `jalr ra`.
+        if let Some(insn) = self.code::<4>(return_address.wrapping_sub(4)) {
+            let insn = u32::from_le_bytes(insn);
+            let call_pc = return_address.wrapping_sub(4);
+
+            if insn & 0xfff == 0x0ef {
+                return Some(Call {
+                    target: Some(call_pc.wrapping_add(j_immediate(insn) as u32)),
+                });
+            }
+
+            if insn & 0x7fff == 0x00e7 {
+                let rs1 = (insn >> 15) & 0x1f;
+                let offset = (insn as i32) >> 20;
+
+                // `auipc ra, hi` + `jalr ra, lo(ra)` is how far calls are
+                // made; anything else is a call through a register.
+                let target = self
+                    .code::<4>(call_pc.wrapping_sub(4))
+                    .map(u32::from_le_bytes)
+                    .filter(|auipc| rs1 == REG_RA as u32 && auipc & 0xfff == 0x097)
+                    .map(|auipc| {
+                        call_pc
+                            .wrapping_sub(4)
+                            .wrapping_add(auipc & 0xffff_f000)
+                            .wrapping_add(offset as u32)
+                    });
+
+                return Some(Call { target });
+            }
+        }
+
+        // A 16-bit `c.jal` (RV32 only) or `c.jalr`.
+        if let Some(insn) = self.code::<2>(return_address.wrapping_sub(2)) {
+            let insn = u16::from_le_bytes(insn);
+            let call_pc = return_address.wrapping_sub(2);
+
+            if insn & 0xe003 == 0x2001 {
+                return Some(Call {
+                    target: Some(call_pc.wrapping_add(cj_immediate(insn) as u32)),
+                });
+            }
+
+            if insn & 0xf07f == 0x9002 && (insn >> 7) & 0x1f != 0 {
+                return Some(Call { target: None });
+            }
+        }
+
+        None
+    }
+
+    /// Lists the calls in the given code range as (return address, target).
+    fn calls(&self, range: std::ops::Range<u32>) -> Vec<(u32, Option<u32>)> {
+        let mut calls = Vec::new();
+        let mut pc = range.start;
+
+        while pc < range.end {
+            let Some(insn) = self.code::<2>(pc) else {
+                break;
+            };
+            let insn = u16::from_le_bytes(insn);
+            let len = if insn & 3 == 3 { 4 } else { 2 };
+            let return_address = pc.wrapping_add(len);
+
+            if let Some(call) = self.call_before(return_address) {
+                calls.push((return_address, call.target));
+            }
+
+            pc = return_address;
+        }
+
+        calls
+    }
+
+    /// Find a chain of calls leading from the given code range to `target`:
+    /// either directly, or through up to `depth` intermediate functions which
+    /// don't save `ra` at their call (never-returning wrappers, which is what
+    /// loses return addresses in the first place).
+    ///
+    /// Returns, for each call along the chain starting with the one in the
+    /// given range, its return address and the (stack pointer based) CFA
+    /// offset of the calling function at that point.
+    fn call_chain(
+        &self,
+        range: std::ops::Range<u32>,
+        target: u32,
+        depth: usize,
+    ) -> Option<Vec<(u32, u32)>> {
+        let calls = self.calls(range);
+
+        let link = |return_address: u32| {
+            let row = self.row(return_address.wrapping_sub(1) as u64)?;
+            let offset = row.sp_cfa_offset? as u32;
+            Some((return_address, offset))
+        };
+
+        if let Some((return_address, _)) = calls.iter().find(|(_, t)| *t == Some(target)) {
+            let (return_address, offset) = link(*return_address)?;
+
+            return Some(vec![(return_address, offset)]);
+        }
+
+        if depth == 0 {
+            return None;
+        }
+
+        for (return_address, callee) in calls {
+            let Some(callee) = callee else {
+                continue;
+            };
+            let Some((return_address, offset)) = link(return_address) else {
+                continue;
+            };
+            let Some(callee_entry) = self.row(callee as u64) else {
+                continue;
+            };
+
+            // Only follow calls into functions which never save `ra`: those
+            // are the never-returning wrappers which lose return addresses,
+            // and they are small, which keeps the search cheap.
+            if callee_entry.function_saves_ra {
+                continue;
+            }
+            let Some(mut chain) = self.call_chain(callee_entry.function.clone(), target, depth - 1)
+            else {
+                continue;
+            };
+            chain.insert(0, (return_address, offset));
+
+            return Some(chain);
+        }
+
+        None
+    }
+
+    /// Reconstruct the callers of the function starting at `function_start`,
+    /// whose frame ends at `cfa`, after that function lost the return address
+    /// into its caller (see [`Failure::ReturnAddressLost`]).
+    ///
+    /// The callers' frames sit right above `cfa`, and the first caller which
+    /// saved its own return address did so at the top of its frame. That
+    /// address is found by scanning the stack upwards for a word which looks
+    /// like a return address, i.e. follows a call. To reject stale words, the
+    /// call must target a function which itself calls `function_start` (if
+    /// need be through other functions which don't save `ra`), and whose
+    /// frame size per its own CFI places its saved return address exactly
+    /// where the word was found.
+    ///
+    /// Returns the reconstructed frames (innermost first) and the registers
+    /// of the frame above them.
+    fn recover(
+        &self,
+        cfa: u32,
+        function_start: u32,
+        memory: &dyn Memory,
+        sp_is_placeholder: bool,
+    ) -> Option<(Vec<Frame>, Registers)> {
+        /// How many functions without a saved `ra` may sit between the
+        /// function which lost the return address and the frame which saved
+        /// one. Rust's panic path has four; the bound only guards against
+        /// runaway searches.
+        const MAX_INTERMEDIATE: usize = 8;
+
+        let mut addr = cfa;
+
+        while let Some(word) = memory.read_u32(addr) {
+            let word_addr = addr;
+            addr = addr.wrapping_add(4);
+
+            let Some(Call {
+                target: Some(caller_start),
+            }) = self.call_before(word)
+            else {
+                continue;
+            };
+
+            // The caller has CFI and does call our function...
+            let Some(caller_entry) = self.row(caller_start as u64) else {
+                continue;
+            };
+            let Some(chain) = self.call_chain(
+                caller_entry.function.clone(),
+                function_start,
+                MAX_INTERMEDIATE,
+            ) else {
+                continue;
+            };
+
+            // ... and the frames along the chain, as they are at those
+            // calls, place the caller's saved return address at the word.
+            let mut frames = Vec::new();
+            let mut sp = cfa;
+            for (return_address, offset) in chain[1..].iter().rev() {
+                frames.push(Frame {
+                    pc: *return_address,
+                    sp,
+                    is_return_address: true,
+                    recovered: true,
+                });
+                sp = sp.wrapping_add(*offset);
+            }
+
+            let (caller_pc, frame_size) = chain[0];
+            let caller_cfa = sp.wrapping_add(frame_size);
+            let Some(caller_row) = self.row(caller_pc.wrapping_sub(1) as u64) else {
+                continue;
+            };
+            let ra_rule = caller_row
+                .registers
+                .iter()
+                .find(|(register, _)| register.0 == REG_RA)
+                .map(|(_, rule)| rule.clone());
+            let Some(RegisterRule::Offset(offset)) = ra_rule else {
+                continue;
+            };
+            if caller_cfa.wrapping_add(offset as u32) != word_addr {
+                continue;
+            }
+
+            frames.push(Frame {
+                pc: caller_pc,
+                sp,
+                is_return_address: true,
+                recovered: true,
+            });
+
+            let mut registers = Registers::new(word);
+            registers.sp_is_placeholder = sp_is_placeholder;
+            registers.set(REG_SP, caller_cfa);
+            for (register, rule) in &caller_row.registers {
+                if let RegisterRule::Offset(offset) = rule
+                    && let Some(value) = memory.read_u32(caller_cfa.wrapping_add(*offset as u32))
+                {
+                    registers.set(register.0, value);
+                }
+            }
+
+            return Some((frames, registers));
+        }
+
+        None
     }
 
     /// Walks the call chain starting at `registers`, reading saved values from
@@ -370,25 +685,43 @@ impl<'a> Unwinder<'a> {
                 pc: registers.pc,
                 sp,
                 is_return_address,
+                recovered: false,
             };
             frames.push(frame);
 
-            match self.step(&registers, frame.lookup_pc(), memory, frames.len() == 1) {
-                Ok(caller) => {
-                    let caller_sp = caller.get(REG_SP).unwrap_or(sp);
+            let caller = match self.step(&registers, frame.lookup_pc(), memory, frames.len() == 1) {
+                Ok(caller) => caller,
+                Err(Failure::ReturnAddressLost {
+                    cfa,
+                    function_start,
+                }) => {
+                    let Some((recovered, caller)) =
+                        self.recover(cfa, function_start, memory, registers.sp_is_placeholder)
+                    else {
+                        return (frames, Stop::ReturnAddressLost(registers.pc));
+                    };
 
-                    // The stack grows downwards, so a caller's frame is never
-                    // below its callee's. Equal stack pointers are only fine
-                    // for the frameless innermost frame.
-                    if caller_sp < sp || (caller_sp == sp && caller.pc == registers.pc) {
-                        return (frames, Stop::Inconsistent);
+                    if frames.len() + recovered.len() > max_frames {
+                        return (frames, Stop::TooManyFrames);
                     }
+                    frames.extend(recovered);
 
-                    registers = caller;
-                    is_return_address = true;
+                    caller
                 }
-                Err(stop) => return (frames, stop),
+                Err(Failure::Stop(stop)) => return (frames, stop),
+            };
+
+            let caller_sp = caller.get(REG_SP).unwrap_or(sp);
+
+            // The stack grows downwards, so a caller's frame is never below
+            // its callee's. Equal stack pointers are only fine for the
+            // frameless innermost frame.
+            if caller_sp < sp || (caller_sp == sp && caller.pc == registers.pc) {
+                return (frames, Stop::Inconsistent);
             }
+
+            registers = caller;
+            is_return_address = true;
         }
     }
 
@@ -402,7 +735,7 @@ impl<'a> Unwinder<'a> {
         lookup_pc: u32,
         memory: &dyn Memory,
         innermost: bool,
-    ) -> Result<Registers, Stop> {
+    ) -> Result<Registers, Failure> {
         let sp = registers.get(REG_SP).ok_or(Stop::UnknownRegister(REG_SP))?;
 
         let Some(row) = self.row(lookup_pc as u64) else {
@@ -422,7 +755,7 @@ impl<'a> Unwinder<'a> {
                 return Ok(caller);
             }
 
-            return Err(Stop::NoUnwindInfo(registers.pc));
+            return Err(Stop::NoUnwindInfo(registers.pc).into());
         };
 
         let cfa = match row.cfa {
@@ -442,11 +775,11 @@ impl<'a> Unwinder<'a> {
                 match (base, row.sp_cfa_offset) {
                     (Some(base), _) => base.wrapping_add(offset as u32),
                     (None, Some(sp_offset)) => sp.wrapping_add(sp_offset as u32),
-                    (None, None) => return Err(Stop::UnknownRegister(register.0)),
+                    (None, None) => return Err(Stop::UnknownRegister(register.0).into()),
                 }
             }
             // DWARF expressions and anything else.
-            _ => return Err(Stop::Unsupported(registers.pc)),
+            _ => return Err(Stop::Unsupported(registers.pc).into()),
         };
 
         let mut caller = Registers::new(0);
@@ -484,14 +817,22 @@ impl<'a> Unwinder<'a> {
             }
         }
 
-        // A function that hasn't (yet) saved `ra` has no rule for it, and
-        // neither has a function whose CFI marks it as the outermost frame.
-        // For the innermost frame the live `ra` is what we need; for the
-        // others `ra` was clobbered by the call to the callee.
+        // A function that hasn't (yet) saved `ra` has no rule for it. For the
+        // innermost frame the live `ra` is then what we need. For any other
+        // frame `ra` was clobbered by the call to the callee, so the return
+        // address is lost; that happens in functions which never return and
+        // therefore don't bother saving it.
+        //
+        // A function whose CFI marks `ra` as undefined is the outermost one.
         let return_address = match ra_rule {
-            None | Some(RegisterRule::Undefined) => {
-                innermost.then(|| registers.get(REG_RA)).flatten()
+            None if innermost => registers.get(REG_RA),
+            None => {
+                return Err(Failure::ReturnAddressLost {
+                    cfa,
+                    function_start: row.function.start,
+                });
             }
+            Some(RegisterRule::Undefined) => None,
             Some(RegisterRule::SameValue) => registers.get(REG_RA),
             Some(RegisterRule::Offset(offset)) => {
                 let addr = cfa.wrapping_add(offset as u32);
@@ -502,11 +843,11 @@ impl<'a> Unwinder<'a> {
             Some(RegisterRule::Register(other)) => registers.get(other.0),
             Some(RegisterRule::Constant(value)) => Some(value as u32),
             // DWARF expressions and anything else.
-            Some(_) => return Err(Stop::Unsupported(registers.pc)),
+            Some(_) => return Err(Stop::Unsupported(registers.pc).into()),
         };
 
         match return_address {
-            None | Some(0) => Err(Stop::EndOfStack),
+            None | Some(0) => Err(Stop::EndOfStack.into()),
             Some(pc) => {
                 caller.pc = pc;
 
@@ -514,6 +855,38 @@ impl<'a> Unwinder<'a> {
             }
         }
     }
+}
+
+/// A call instruction, with its target unless it goes through a register.
+struct Call {
+    target: Option<u32>,
+}
+
+/// Decodes the immediate of a J-type (`jal`) instruction.
+fn j_immediate(insn: u32) -> i32 {
+    let imm = ((insn >> 31) & 1) << 20
+        | ((insn >> 21) & 0x3ff) << 1
+        | ((insn >> 20) & 1) << 11
+        | ((insn >> 12) & 0xff) << 12;
+
+    // Sign-extend from 21 bits.
+    ((imm << 11) as i32) >> 11
+}
+
+/// Decodes the immediate of a CJ-type (`c.jal`) instruction.
+fn cj_immediate(insn: u16) -> i32 {
+    let insn = insn as u32;
+    let imm = ((insn >> 12) & 1) << 11
+        | ((insn >> 11) & 1) << 4
+        | ((insn >> 9) & 3) << 8
+        | ((insn >> 8) & 1) << 10
+        | ((insn >> 7) & 1) << 6
+        | ((insn >> 6) & 1) << 7
+        | ((insn >> 3) & 7) << 1
+        | ((insn >> 2) & 1) << 5;
+
+    // Sign-extend from 12 bits.
+    ((imm << 20) as i32) >> 20
 }
 
 fn section_data<'a>(file: &object::File<'a>, name: &str) -> Option<&'a [u8]> {

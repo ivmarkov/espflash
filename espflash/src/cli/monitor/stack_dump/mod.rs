@@ -137,6 +137,9 @@ pub(crate) fn print_backtrace(
 
     let note = match stop {
         Stop::EndOfStack => None,
+        Stop::ReturnAddressLost(pc) => Some(format!(
+            "0x{pc:08x} didn't save the return address of its caller, which couldn't be reconstructed from the stack"
+        )),
         Stop::NoUnwindInfo(pc) => Some(format!(
             "no unwind info for 0x{pc:08x}; is the ELF built with debug info?"
         )),
@@ -172,8 +175,19 @@ fn format_frame(frame: &Frame, symbols: &[Symbols<'_>], out: &mut String) {
         .find(|frames| !frames.is_empty())
         .unwrap_or_default();
 
+    // A frame whose return address was lost and which was reconstructed
+    // from the stack (see `cfi_unwind::Unwinder::recover`) is marked as such.
+    let marker = if frame.recovered {
+        "(reconstructed) "
+    } else {
+        ""
+    };
+
     if resolved.is_empty() {
-        out.push_str(&format!("0x{:08x} - ??\r\n    at ??:??\r\n", frame.pc));
+        out.push_str(&format!(
+            "0x{:08x} - {marker}??\r\n    at ??:??\r\n",
+            frame.pc
+        ));
         return;
     }
 
@@ -182,7 +196,7 @@ fn format_frame(frame: &Frame, symbols: &[Symbols<'_>], out: &mut String) {
         let name = function.name.as_deref().unwrap_or("??");
 
         if index == 0 {
-            out.push_str(&format!("0x{:08x} - {name}\r\n", frame.pc));
+            out.push_str(&format!("0x{:08x} - {marker}{name}\r\n", frame.pc));
         } else {
             out.push_str(&format!("    (inlined by) {name}\r\n"));
         }

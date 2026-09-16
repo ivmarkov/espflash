@@ -503,6 +503,79 @@ Rebooting...
         assert_eq!(output.matches("app_main").count(), 1, "{output}");
     }
 
+    /// Lays out `words` as ESP-IDF prints the stack memory, starting at the
+    /// stack pointer of `ESPIDF_ABORT_DUMP`.
+    fn espidf_stack_lines(words: &[u32]) -> String {
+        let mut stack = String::new();
+        for (index, line) in words.chunks(8).enumerate() {
+            stack.push_str(&format!("{:08x}:", 0x40815e10 + 32 * index));
+            for word in line {
+                stack.push_str(&format!(" 0x{word:08x}"));
+            }
+            stack.push('\n');
+        }
+
+        stack
+    }
+
+    #[test]
+    fn reconstructs_caller_after_lost_return_address() {
+        // `abort` (112 byte frame) "returns" into `panic_abort`, which never
+        // saves `ra`, so the return address into panic_abort's caller is
+        // lost. The stack above panic_abort's frame holds a stale return
+        // address first (after a call to `puts`, which doesn't call
+        // panic_abort) and then the real one: the return address into `abort`
+        // after its call to `esp_system_abort`, which does call panic_abort
+        // and has a 16 byte frame. From there the chain continues normally.
+        let elf = espidf_elf();
+        let mut words = vec![0u32; 80];
+        words[27] = 0x40803956; // ra saved by abort (cfa-4): inside panic_abort
+        words[28] = 0x42005e86; // stale: app_main after `jal puts`
+        words[31] = 0x40808282; // abort after `jal esp_system_abort`
+        words[59] = 0x42005e86; // ra saved by abort: app_main
+        words[67] = 0x4200e598; // ra saved by app_main: main_task
+        let (head, _) = ESPIDF_ABORT_DUMP.split_once("40815e10: ").unwrap();
+        let dump = format!("{head}{}\n\nRebooting...\n", espidf_stack_lines(&words))
+            .replace("MEPC    : 0x40803956", "MEPC    : 0x40808240");
+        let output = print(vec![&elf], &dump);
+
+        assert_in_order(
+            &output,
+            &[
+                "0x40808240 - abort\r\n",
+                "0x40803956 - panic_abort\r\n",
+                "0x40803914 - (reconstructed) esp_system_abort\r\n    at /Users/playfulfence/esp/esp-idf/components/esp_system/port/esp_system_chip.c:87\r\n",
+                "0x40808282 - abort\r\n",
+                "0x42005e86 - app_main\r\n",
+                "0x4200e598 - main_task\r\n",
+            ],
+        );
+        assert!(!output.contains("backtrace stopped"), "{output}");
+        assert_eq!(output.matches("esp_system_abort").count(), 1, "{output}");
+    }
+
+    #[test]
+    fn reports_lost_return_address() {
+        // As above, but with nothing usable on the stack above panic_abort.
+        let elf = espidf_elf();
+        let mut words = vec![0u32; 40];
+        words[27] = 0x40803956;
+        words[28] = 0x42005e86;
+        let (head, _) = ESPIDF_ABORT_DUMP.split_once("40815e10: ").unwrap();
+        let dump = format!("{head}{}\n\nRebooting...\n", espidf_stack_lines(&words))
+            .replace("MEPC    : 0x40803956", "MEPC    : 0x40808240");
+        let output = print(vec![&elf], &dump);
+
+        assert_in_order(
+            &output,
+            &[
+                "0x40808240 - abort\r\n",
+                "0x40803956 - panic_abort\r\n",
+                "(backtrace stopped: 0x40803956 didn't save the return address of its caller",
+            ],
+        );
+    }
+
     #[test]
     fn decodes_espidf_dump_with_bogus_pc() {
         // A jump through a bad pointer: no unwind info for the PC, so the

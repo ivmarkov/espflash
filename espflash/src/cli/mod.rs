@@ -333,9 +333,10 @@ pub struct MonitorConfigArgs {
     /// Try to resolve all addresses, even well-known misleading ones
     #[arg(long)]
     pub all_addresses: bool,
-    /// Which unwind tables of the ELF to decode stack dumps with
-    #[arg(long, default_value_t)]
-    pub unwind_tables: UnwindTables,
+    /// Which unwind tables of the ELF to decode stack dumps with (default:
+    /// auto)
+    #[arg(long)]
+    pub unwind_tables: Option<UnwindTables>,
 }
 
 /// Arguments for MD5 checksum calculation

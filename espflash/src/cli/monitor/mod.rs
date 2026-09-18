@@ -134,7 +134,7 @@ pub fn monitor(
             elfs,
             stdout.lock(),
             monitor_args.all_addresses,
-            monitor_args.unwind_tables,
+            monitor_args.unwind_tables.unwrap_or_default(),
         )
     };
 
@@ -502,6 +502,7 @@ pub fn check_monitor_args(
             || monitor_args.no_reset
             || monitor_args.no_addresses
             || monitor_args.all_addresses
+            || monitor_args.unwind_tables.is_some()
             || monitor_args.monitor_baud != 115_200)
     {
         warn!(
